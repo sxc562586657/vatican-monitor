@@ -2,12 +2,8 @@ name: Vatican Museums Ticket Monitor
 
 on:
   schedule:
-    # Every 10 minutes between 22:00-08:00 UTC (midnight-10am Rome time)
-    # Vatican time is UTC+2 in summer. Tickets are released ~midnight Rome time.
-    - cron: "*/10 22-23,0-7 * * *"
-    # Also check hourly during daytime
-    - cron: "0 8-21 * * *"
-  workflow_dispatch:  # Manual trigger
+    - cron: "*/5 * * * *"   # Every 5 minutes, 24/7
+  workflow_dispatch:          # Manual trigger
 
 jobs:
   check:
