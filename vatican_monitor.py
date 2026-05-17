@@ -193,6 +193,32 @@ def notify_telegram(bot_token: str, chat_id: str, message: str):
 ICON = {"AVAILABLE": "🟢", "LOW_AVAILABILITY": "🟡", "SOLD_OUT": "🔴"}
 
 
+def _date_to_ms(date_str: str) -> int:
+    """Convert dd/MM/yyyy to Unix ms at 09:00 Europe/Rome (Vatican opening time).
+
+    Matches the site's existing URL convention so the SPA resolves the date
+    correctly regardless of the user's local timezone.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Europe/Rome")
+    except Exception:
+        from datetime import timezone, timedelta
+        tz = timezone(timedelta(hours=2))  # CEST fallback (May-Oct)
+    dt = datetime.strptime(date_str, "%d/%m/%Y").replace(hour=9, tzinfo=tz)
+    return int(dt.timestamp() * 1000)
+
+
+def _build_deep_link(visitor_num: int, date_str: str,
+                     visit_type_id: Optional[int] = None,
+                     area_id: str = AREA_ID) -> str:
+    """Build a clickable URL pointing directly at the ticket/date/visitors."""
+    date_ms = _date_to_ms(date_str)
+    if visit_type_id:
+        return f"{BASE_URL}/home/visit/{visitor_num}/{date_ms}/{area_id}/{visit_type_id}"
+    return f"{BASE_URL}/home/fromtag/{visitor_num}/{date_ms}/{TAG}/{area_id}"
+
+
 def print_time_slots(timetable: list, before: str = "23:59"):
     """Print time slots — only available ones before cutoff, skip SOLD_OUT."""
     available = [
@@ -223,10 +249,11 @@ def _find_ticket(visits: list, names: list[str], alt_names: list[str]):
 
 
 def _process_ticket(visit: dict, vn: int, date_str: str, label: str,
-                    before: str) -> tuple[bool, bool]:
+                    before: str, findings: list = None) -> tuple[bool, bool]:
     """
     Process a single ticket visit.
     Returns (is_available, should_continue_checking).
+    If `findings` list is passed, appends a dict describing what was found.
     """
     avail = visit.get("availability", "UNKNOWN")
     vid = visit.get("id")
@@ -277,6 +304,29 @@ def _process_ticket(visit: dict, vn: int, date_str: str, label: str,
                 if avail_slots:
                     print(f"      Time slots:")
                     print_time_slots(slots["timetable"], before)
+
+            if findings is not None:
+                avail_slots_info = []
+                if vid and slots and slots.get("timetable"):
+                    for s in slots["timetable"]:
+                        if (s.get("availability") != "SOLD_OUT"
+                                and s.get("time", "24:00") <= before):
+                            avail_slots_info.append({
+                                "time": s.get("time"),
+                                "availability": s.get("availability"),
+                                "residual": s.get("residual"),
+                            })
+                findings.append({
+                    "ticket": name,
+                    "date": date_str,
+                    "label": label,
+                    "visitors": vn,
+                    "availability": avail,
+                    "price": price,
+                    "slots": avail_slots_info,
+                    "visit_type_id": vid,
+                    "deep_link": _build_deep_link(vn, date_str, vid),
+                })
             return True, False
     else:
         print(f"  🔴 {label} ({vn}p) — {name}: {avail}")
@@ -286,10 +336,12 @@ def _process_ticket(visit: dict, vn: int, date_str: str, label: str,
 # ─── MAIN LOGIC ──────────────────────────────────────────────────────────────
 
 def check_date(date_str: str, visitor_nums: list[int], before: str = "23:59",
-               log: "Logger" = None) -> tuple[bool, bool]:
+               log: "Logger" = None,
+               findings: list = None) -> tuple[bool, bool]:
     """
     Check a single date across multiple visitor counts.
     Returns (found_available, has_any_data).
+    If `findings` list is passed, available tickets are appended to it.
     """
     if log is None:
         log = Logger()
@@ -312,7 +364,7 @@ def check_date(date_str: str, visitor_nums: list[int], before: str = "23:59",
             visits, [ADMISSION_TICKET_NAME], ADMISSION_TICKET_ALT_NAMES
         )
         if admission:
-            ok, _ = _process_ticket(admission, vn, date_str, label, before)
+            ok, _ = _process_ticket(admission, vn, date_str, label, before, findings)
             if ok:
                 found_available = True
         else:
@@ -322,22 +374,54 @@ def check_date(date_str: str, visitor_nums: list[int], before: str = "23:59",
         for et_name in EXTRA_TICKETS:
             et = _find_ticket(visits, [et_name], [])
             if et:
-                ok, _ = _process_ticket(et, vn, date_str, label, before)
+                ok, _ = _process_ticket(et, vn, date_str, label, before, findings)
                 if ok:
                     found_available = True
 
     return found_available, has_data
 
 
-def _send_alerts(args, visitor_nums, dates):
+def _format_findings(findings: list) -> str:
+    """Build a detailed multi-line description of the available tickets."""
+    if not findings:
+        return "Admission Ticket available!"
+    lines = []
+    for f in findings:
+        price = f" | €{f['price']}" if f.get("price") else ""
+        header = (
+            f"🎟️ {f['ticket']}\n"
+            f"   {f['label']} | {f['visitors']}p"
+            f" | {f['availability']}{price}"
+        )
+        lines.append(header)
+        slots = f.get("slots") or []
+        if slots:
+            for s in slots[:8]:  # cap to avoid huge messages
+                lines.append(
+                    f"     • {s['time']} ({s['availability']},"
+                    f" {s['residual']} left)"
+                )
+            if len(slots) > 8:
+                lines.append(f"     • …and {len(slots) - 8} more slots")
+        if f.get("deep_link"):
+            lines.append(f"   👉 {f['deep_link']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _send_alerts(args, visitor_nums, dates, findings=None):
     """Send alerts via all configured channels."""
     title = "🎟️ Vatican Tickets!"
-    msg = (
-        f"Admission Ticket available!\n"
-        f"Visitors: {visitor_nums}\n"
-        f"Dates: {', '.join(dates)}\n"
-        f"{BASE_URL}/home/fromtag/4/1780124400000/MV-Biglietti/1"
-    )
+    if findings:
+        msg = _format_findings(findings)
+    else:
+        fallback_link = _build_deep_link(visitor_nums[0], dates[0])
+        msg = (
+            f"Admission Ticket available!\n"
+            f"Visitors: {visitor_nums}\n"
+            f"Dates: {', '.join(dates)}\n\n"
+            f"{fallback_link}"
+        )
 
     if args.notify:
         notify(title, msg)
@@ -444,16 +528,20 @@ def main():
     if args.once:
         print()
         any_found = False
+        findings = []
         for date_str in dates:
-            found, _ = check_date(date_str, visitor_nums, args.before)
+            found, _ = check_date(date_str, visitor_nums, args.before,
+                                  findings=findings)
             if found:
                 any_found = True
 
         print("\n" + "=" * 58)
         if any_found:
             print("  ✅ ADMISSION TICKETS AVAILABLE! 🎉")
-            print("  Go to:", f"{BASE_URL}/home/fromtag/4/1780124400000/MV-Biglietti/1")
-            _send_alerts(args, visitor_nums, dates)
+            for f in findings:
+                if f.get("deep_link"):
+                    print(f"  👉 {f['label']} ({f['visitors']}p): {f['deep_link']}")
+            _send_alerts(args, visitor_nums, dates, findings)
         else:
             print("  ❌ No admission tickets available.")
         print("=" * 58)
@@ -470,9 +558,11 @@ def main():
 
         any_available = False
         any_data = False
+        findings = []
 
         for date_str in dates:
-            found, has_data = check_date(date_str, visitor_nums, args.before)
+            found, has_data = check_date(date_str, visitor_nums, args.before,
+                                         findings=findings)
             if found:
                 any_available = True
             if has_data:
@@ -481,7 +571,7 @@ def main():
         if any_available:
             msg = "🎉 Vatican Museums Admission Ticket AVAILABLE!"
             print(f"\n  {msg}")
-            _send_alerts(args, visitor_nums, dates)
+            _send_alerts(args, visitor_nums, dates, findings)
         else:
             status = "SOLD OUT" if any_data else "API error"
             print(f"  📊 Status: {status}")
